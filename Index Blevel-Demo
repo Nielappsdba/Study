@@ -1,0 +1,266 @@
+set lines 200
+col name for a30
+select substr(name,1,30) name,substr(value,1,20) value
+from v$parameter
+where name in ('db_block_size','compatible','cpu_count','db_file_multiblock_read_count' ,'optimizer_mode','sga_target','sort_area_size')
+order by name;
+
+I got something wrong on a couple of postings recently, namely the relationship between BLEVEL and the number of blocks needed to read “down” an index, the true depth or HEIGHT of the index {I used to know this but I forgot, but heck no one pinged me on the two posts in question, so I got away with it 🙂 – I’ve updated the postings already.}
+
+BLEVEL is the number of branch levels (including the root node) in a B-Tree index. Height is the actual depth of the index. Height is BLEVEL plus one. So when you see BLEVEL of 3 against an index in DBA_INDEXES/DBA_IND_STATISTICS, that means the index has a root node, a first level of Branch blocks, then a second level of Branch blocks and finally the Leaf blocks (which hold the indexed values and rowids to the table entries).
+
+Thus to scan the index for one unique entry, Oracle will need to read the root node to locate the correct branch node in branch level one, read that to find the correct branch node in branch level 2 and that will lead to the correct leaf block. That is four blocks to read. The leaf block contains the index entry and the rowid of the relevant data block, which allows oracle to go directly to that block, for the fifth block read.
+
+{I’m having trouble finding a nice diagram of this {{ I hate the one in the Oracle manuals}}, not even on Mr Foote’s or Mr Lewis’s pages, so if you spot one before I do, let me know and I’ll update this page with a relevant link}.
+{Update 18 months later – I finally drew a nice diagram of the index-rowid-table_row path.}
+
+Some documentation on the Web mentions HEIGHT being held in the index stats table. This is SYS.INDEX_STATS, not the DBA_IND_STATISTICS table, and SYS.INDEX_STATS is only populated when you run the old “ANLAYZE INDEX index_name VALIDATE STRUCTURE” command, so ignore that. You should not really be using the old ANALYZE command any more.
+
+The below demonstrates the increasing BLEVEL and the number of consistent gets to select one record {it’s more complicated if you 
+
+NAME                           VALUE
+------------------------------ --------------------
+compatible                     10.2.0.3.0
+cpu_count                      8
+db_block_size                  8192
+db_file_multiblock_read_count  16
+optimizer_mode                 ALL_ROWS
+sga_target                     0
+sort_area_size                 65536
+ 
+create table test_bl
+ (id    number(8) not null
+ ,status number(1) not null
+ ,num_1     number(3) not null -- random 20
+ ,num_2     number(3) -- random 20
+ ,num_3     number(5) -- cycle smoothly
+ ,num_4     number(5) -- cycle smoothly
+ ,vc_1      varchar2(10)
+ ,vc_2      varchar2(10)
+ ,vc_pad varchar2(2000))
+ tablespace users
+ /
+Table created.
+
+insert into test_bl(id,status,num_1,num_2,num_3,num_4
+                   ,vc_1,vc_2,vc_pad)
+select rownum,decode(mod(rownum,100),0,1
+               ,0)
+,trunc(dbms_random.value(1,20))
+,trunc(dbms_random.value(1,30))
+,mod(rownum,10)+1
+,mod(rownum,100)+1
+,dbms_random.string('U',10)
+,lpad(chr(mod(rownum,6)+65),5,chr(mod(rownum,6)+65) )
+,lpad('A',100,'A')
+from dba_objects
+where rownum < 500
+/
+499 rows created.
+ 
+commit;
+Commit complete.
+ 
+-- now add a pK on the ID
+alter table test_bl
+add constraint tb_pk primary key (id)
+using index
+tablespace users
+ /
+Table altered.
+ 
+begin
+  dbms_stats.gather_table_stats(user,'TEST_BL');
+END;
+/
+PL/SQL procedure successfully completed.
+
+select index_name,blevel,leaf_blocks
+from dba_indexes
+where owner=user
+and index_name like 'TB%
+
+So I’ve created the test table, put 499 records in it and added the index, via a primary key constraint. The index created has one leaf block in it and a BLEVEL of 0.
+
+Now let’s select a record via it {and the reason I put 499 records in the table is so that oracle decides to use the index and not a full table scan,
+which would be a likely choice by CBO with a very small table}.
+set autotrace on
+select vc_1 from test_bl where id=54
+ /
+ 
+VC_1
+----------
+BRFVRHEMWP
+1 row selected.
+ 
+Execution Plan
+----------------------------------------------------------
+| Id| Operation                   | Name    | Rows  |Bytes| Cost|
+----------------------------------------------------------
+| 0 | SELECT STATEMENT            |         |    1 |  15 |  1  (0)|
+| 1 |  TABLE ACCESS BY INDEX ROWID| TEST_BL |    1 |  15 |  1  (0)|
+|*2 |   INDEX UNIQUE SCAN         | TB_PK   |    1 |     |  0  (0)|
+----------------------------------------------------------
+ 
+Statistics
+----------------------------------------------------------
+          1  recursive calls
+          0  db block gets
+          2  consistent gets
+          0  physical reads
+          0  redo size
+        339  bytes sent via SQL*Net to client
+        338  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+ 
+select vc_1 from test_bl where id=54
+ /
+ 
+VC_1
+----------
+BRFVRHEMWP
+1 row selected.
+ 
+Execution Plan
+|Id | Operation                   | Name    | Rows |Bytes| Cost
+----------------------------------------------------------
+| 0 | SELECT STATEMENT            |         |    1 |  15 | 1   (0)|
+| 1 |  TABLE ACCESS BY INDEX ROWID| TEST_BL |    1 |  15 | 1   (0)|
+|*2 |   INDEX UNIQUE SCAN         | TB_PK   |    1 |     | 0   (0)|
+-----------------------------------------------------------
+ 
+ 
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+          2  consistent gets
+          0  physical reads
+
+I generally run test selects twice, to remove any parsing and recursive SQL overhead {I’ll remove these from the rest of this post}. So, 2 consistent gets. That would be one on the index and one on the table then.
+Note the cost of the index index unique scan – 0. See end. 
+Now I’ll add more data and grow the index.
+set autotrace off echo off
+insert into test_bl(id,status,num_1,num_2,num_3,num_4
+                  ,vc_1,vc_2,vc_pad)
+select rownum+500,decode(mod(rownum,100),0,1
+              ,0)
+,trunc(dbms_random.value(1,20)) 
+,trunc(dbms_random.value(1,30)) 
+,mod(rownum,10)+1
+,mod(rownum,100)+1
+,dbms_random.string('U',5)
+,lpad(chr(mod(rownum,6)+65),5,chr(mod(rownum,6)+65) )
+,lpad('A',100,'A')
+from dba_objects
+where rownum < 5500
+/
+5499 rows created.
+ 
+begin
+  dbms_stats.gather_table_stats(user,'TEST_BL');
+END;
+/
+PL/SQL procedure successfully completed.
+ 
+select index_name,blevel,leaf_blocks
+from dba_indexes
+where owner=user
+and index_name like 'TB%'
+/
+
+INDEX_NAME                         BLEVEL LEAF_BLOCKS
+------------------------------ ---------- -----------
+TB_PK                                   1          11
+So now we have a BLEVEL of 1 and 11 leaf blocks. That will be a root node and below it the leaf blocks. Let’s try a select:
+select vc_1 from test_bl where id=454
+/
+VC_1
+----------
+IQGSEOCCCH
+ 
+Execution Plan
+----------------------------------------------------------
+|Id | Operation                   | Name    | Rows  |Bytes| Cost|
+----------------------------------------------------------
+| 0 | SELECT STATEMENT            |         |     1 |  11 | 2   (0)|
+| 1 |  TABLE ACCESS BY INDEX ROWID| TEST_BL |     1 |  11 | 2   (0)|
+|*2 |   INDEX UNIQUE SCAN         | TB_PK   |     1 |     | 1   (0)|
+-----------------------------------------------------------
+ 
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+          3  consistent gets
+          0  physical reads
+3 consistent gets, one for the root node, one for the relevant leaf block and one for the data block holding the record.
+
+Now I’ll insert about 400,000 more records to cause the index to become one level deeper. (You might be interested to know that 300,000 records was not enough to cause a layer of branch nodes to be created, though as I am indexing an ascending numerical column, each index entry is not exactly huge. This does show that the BLEVEL does not scale with data volume – but it ‘does not scale’ in a very beneficial way. 
+You need to massively increase the volume of data between increasing BLEVELs.) 
+
+I will then select my record:
+99999 rows created.
+99999 rows created.
+99999 rows created.
+99999 rows created.
+ 
+begin
+  dbms_stats.gather_table_stats(ownname=>user,tabname =>'TEST_BL'
+                                ,estimate_percent=> 10);
+END;
+ /
+PL/SQL procedure successfully completed.
+ 
+INDEX_NAME                         BLEVEL LEAF_BLOCKS
+------------------------------ ---------- -----------
+TB_PK                                   2         761
+ 
+set autotrace on
+select vc_1 from test_bl where id=454
+ /
+ 
+VC_1
+----------
+IQGSEOCCCH
+1 row selected.
+ 
+Execution Plan
+----------------------------------------------------------
+|Id | Operation                   | Name    | Rows  |Bytes| Cost|
+--------------------------------------------------------
+| 0 | SELECT STATEMENT            |         |     1 |  12 | 3   (0)|
+| 1 |  TABLE ACCESS BY INDEX ROWID| TEST_BL |     1 |  12 | 3   (0)|
+|*2 |   INDEX UNIQUE SCAN         | TB_PK   |     1 |     | 2   (0)|
+---------------------------------------------------------
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+          4  consistent gets
+          0  physical reads
+
+The index BLEVEL has gone up to 2 {index height is 3} and now 4 consistent gets are needed to fetch the record.
+
+You may have noticed that the estimated cost of the INDEX_UNIQUE_SCAN is the same as the BLEVEL, which is not really correct. After all, in the first example the cost was 0 and there has to be a read of the index leaf block! The costing makes more sense when it is part of the calculation for scanning an index and then visiting the table for all found records:-
+
+“basic index range scan cost = index blevel + ceil(index selectivity x leaf blocks) + ceil(table selectivity x clustering factor)”
+
+In words this formula means “go down the index to the leaf nodes (this is the BLEVEL), scan the number of leaf nodes expected for this index value, then visit the number of table blocks this set of index entries would map to”.
+
+For more information on the formula, I’d plug part of that formula into google (or bing or whatever takes your fancy, search-engine-wise). The original is this page by Richard Foote but there are some good notes by others as well.
+
+There are a lot of references on the web about the cost of accesing an index being the BLEVEL, but remember, if it is a unique access it is the BLEVEL plus one, and oracle seems (in my little tests anyway) to be underestimating the cost by 1. I think this reference to the BLEVEL and the costs might be leading to people into mistaking the BLEVEL as the actual height of the index.
+
+
+
+The problem with any of the “inside information” about Oracle is that there are always special cases that don’t quite follow the rules. The general formula for the cost of accessing a single table by b-tree index is::
+
+blevel + estimated leaf block accesses + estimated table block accesses
+
+except – if the blevel is 1 it is ignored, and if the access is a unique index used for a unique access then you subtract 1 from the cost.
+
