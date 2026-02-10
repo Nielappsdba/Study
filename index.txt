@@ -1,0 +1,10 @@
+Thus to scan the index for one unique entry, 
+Oracle will need to read the root node to locate the correct branch node in branch level one, 
+read that to find the correct branch node in branch level 2 and that will lead to the correct leaf block. 
+
+That is four blocks to read. The leaf block contains the index entry and the rowid of the relevant data block, 
+which allows oracle to go directly to that block, for the fifth block read.
+
+I got something wrong on a couple of postings recently, namely the relationship between BLEVEL and the number of blocks needed to read “down” an index, the true depth or HEIGHT of the index {I used to know this but I forgot, but heck no one pinged me on the two posts in question, so I got away with it 🙂 – I’ve updated the postings already.}
+
+BLEVEL is the number of branch levels (including the root node) in a B-Tree index. Height is the actual depth of the index. Height is BLEVEL plus one. So when you see BLEVEL of 3 against an index in DBA_INDEXES/DBA_IND_STATISTICS, that means the index has a root node, a first level of Branch blocks, then a second level of Branch blocks and finally the Leaf blocks (which hold the indexed values and rowids to the table entries).
